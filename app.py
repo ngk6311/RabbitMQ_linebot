@@ -1,72 +1,48 @@
-import pandas as pd
-from spacy import displacy
-from spacy.tokens import Doc
-from spacy.vocab import Vocab
-from spacy_streamlit.util import get_html
-import streamlit as st
-import torch
-from transformers import BertTokenizerFast
+import pika
+import requests
 
-from model import BertForTokenAndSequenceJointClassification
+from config import MQ_DEFAULTS  # 匯入 RabbitMQ 的連線設定
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import TextSendMessage
+from linebot.exceptions import LineBotApiError
 
+# 初始化 Line Bot 的 API
+line_bot_api = LineBotApi('YOUR_CHANNEL_ACCESS_TOKEN')
 
-@st.cache(allow_output_mutation=True)
-def load_model():
-    tokenizer = BertTokenizerFast.from_pretrained('bert-base-cased')
-    model = BertForTokenAndSequenceJointClassification.from_pretrained(
-            "QCRI/PropagandaTechniquesAnalysis-en-BERT",
-             revision="v0.1.0")
-    return tokenizer, model
+# RabbitMQ 訊息接收回呼函式
+def callback(ch, method, properties, body):
+    message = body.decode('utf-8')  # 將 RabbitMQ 訊息解碼為字串
+    try:
+        # 建立 Line Bot 訊息物件
+        text_message = TextSendMessage(text=message)
+        # 發送訊息到 Line Bot
+        line_bot_api.push_message('USER_ID', messages=[text_message])  # 替換成接收訊息的 Line 使用者 ID
+    except LineBotApiError as e:
+        print(f"Line Bot 發送訊息失敗: {e}")
 
-with torch.inference_mode(True):
-    tokenizer, model = load_model()
+# 建立 RabbitMQ 連線
+connection = pika.BlockingConnection(pika.ConnectionParameters(
+    host=MQ_DEFAULTS['HOST'],
+    port=int(MQ_DEFAULTS['PORT']),
+    virtual_host=MQ_DEFAULTS['VHOST'],
+    credentials=pika.PlainCredentials(
+        MQ_DEFAULTS['USER'], MQ_DEFAULTS['PASSWORD'])
+))
+channel = connection.channel()
 
-    st.write("[Propaganda Techniques Analysis BERT](https://huggingface.co/QCRI/PropagandaTechniquesAnalysis-en-BERT) Tagger")
+# 建立 exchange，這裡使用 fanout 交換機
+channel.exchange_declare(exchange='logs', exchange_type='fanout')
 
-    input = st.text_area('Input', """\
-    In some instances, it can be highly dangerous to use a medicine for the prevention or treatment of COVID-19 that has not been approved by or has not received emergency use authorization from the FDA.
-    """)
+# 建立隨機生成的 queue
+result = channel.queue_declare(queue='', exclusive=True)
+queue_name = result.method.queue
 
-    inputs = tokenizer.encode_plus(input, return_tensors="pt")
-    outputs = model(**inputs)
-    sequence_class_index = torch.argmax(outputs.sequence_logits, dim=-1)
-    sequence_class = model.sequence_tags[sequence_class_index[0]]
-    token_class_index = torch.argmax(outputs.token_logits, dim=-1)
-    tokens = tokenizer.convert_ids_to_tokens(inputs.input_ids[0][1:-1])
-    tags = [model.token_tags[i] for i in token_class_index[0].tolist()[1:-1]]
+# 將隊列綁定到交換機
+channel.queue_bind(exchange='logs', queue=queue_name)
 
-columns = st.columns(len(outputs.sequence_logits.flatten()))
-for col, sequence_tag, logit in zip(columns, model.sequence_tags, outputs.sequence_logits.flatten()):
-    col.metric(sequence_tag, '%.2f' % logit.item())
+# 設定回呼函式來處理訊息
+channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=True)
 
-
-spaces = [not tok.startswith('##') for tok in tokens][1:] + [False]
-
-doc = Doc(Vocab(strings=set(tokens)),
-          words=tokens,
-          spaces=spaces,
-          ents=[tag if tag == "O" else f"B-{tag}" for tag in tags])
-
-labels = model.token_tags[2:]
-
-label_select = st.multiselect(
-    "Tags",
-    options=labels,
-    default=labels,
-    key=f"tags_ner_label_select",
-)
-html = displacy.render(
-    doc, style="ent", options={"ents": label_select, "colors": {}}
-)
-style = "<style>mark.entity { display: inline-block }</style>"
-st.write(f"{style}{get_html(html)}", unsafe_allow_html=True)
-
-attrs = ["text", "label_", "start", "end", "start_char", "end_char"]
-data = [
-    [str(getattr(ent, attr)) for attr in attrs]
-    for ent in doc.ents
-    if ent.label_ in label_select
-]
-if data:
-    df = pd.DataFrame(data, columns=attrs)
-    st.dataframe(df)
+# 開始接收 RabbitMQ 訊息
+print('Waiting for RabbitMQ messages. To exit press CTRL+C')
+channel.start_consuming()
