@@ -6,8 +6,10 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
 from linebot.exceptions import LineBotApiError
 
-# 初始化 Line Bot 的 API
-line_bot_api = LineBotApi('YOUR_CHANNEL_ACCESS_TOKEN')
+# Channel Access Token
+line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
+# Channel Secret
+handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
 # RabbitMQ 訊息接收回呼函式
 def callback(ch, method, properties, body):
